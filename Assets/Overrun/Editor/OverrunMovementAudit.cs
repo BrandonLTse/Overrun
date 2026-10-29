@@ -45,6 +45,7 @@ public static class OverrunMovementAudit
         if (EditorApplication.timeSinceStartup - enteredPlay < 3) return;
         var currentLevel = UnityEngine.Object.FindAnyObjectByType<LevelGenerator>();
         if ((currentLevel == null || currentLevel.Map == null) && EditorApplication.timeSinceStartup - enteredPlay < 15) return;
+        if (!EnsurePlaying()) return;
         File.Move(Request, Request + ".completed-" + DateTime.UtcNow.Ticks);
         SessionState.EraseInt(Phase);
         var report = new StringBuilder();
@@ -72,7 +73,16 @@ public static class OverrunMovementAudit
         throw new InvalidOperationException("No free layer slot for Walls.");
     }
 
-    static void Verify(StringBuilder report)
+    // Gameplay audits explicitly enter a run; the prototype no longer auto-starts.
+    public static bool EnsurePlaying()
+    {
+        var menus = OverrunMenus.Instance;
+        if (menus && menus.State == OverrunMenus.ScreenState.MainMenu) { menus.StartRun(); return false; }
+        if (menus && menus.State == OverrunMenus.ScreenState.Paused) { menus.Resume(); return false; }
+        return !OverrunMenus.InputBlocked;
+    }
+
+    public static void Verify(StringBuilder report)
     {
         var player = UnityEngine.Object.FindAnyObjectByType<OverrunPlayer>();
         var level = UnityEngine.Object.FindAnyObjectByType<LevelGenerator>();
@@ -85,9 +95,12 @@ public static class OverrunMovementAudit
         var startCell = level.Map.WorldToCell(level.PlayerStart);
         Require(level.Map.IsWalkable(startCell), "Spawn is blocked in navigation grid.");
         Require(!Physics2D.OverlapCircle(level.PlayerStart, .4f, walls), "Spawn overlaps scenery.");
-        Require(!level.Map.IsWalkable(new Vector2Int(32, 24)), "Desk/chair at the old starting cell is incorrectly walkable.");
-        Require(player.GetComponent<SpriteRenderer>().sprite, "Player sprite missing after Play Mode restart.");
-        report.AppendLine($"Safe spawn: {level.PlayerStart}; old desk spawn (32,24) correctly blocked.");
+        var proceduralRooms = level.GetComponentsInChildren<OverrunProceduralRoom>();
+        bool procedural = proceduralRooms.Length > 0;
+        if (!procedural) Require(!level.Map.IsWalkable(new Vector2Int(32, 24)), "Desk/chair at the old starting cell is incorrectly walkable.");
+        var visual = player.GetComponentInChildren<SpriteRenderer>();
+        Require(visual && visual.sprite, "Player sprite missing after Play Mode restart.");
+        report.AppendLine($"Safe spawn: {level.PlayerStart}; generation={(procedural ? "procedural" : "Tiled")}.");
 
         var camera = Camera.main;
         Require(camera && Mathf.Approximately(camera.orthographicSize, 7.5f), "Camera is not at the original zoom.");
@@ -96,6 +109,12 @@ public static class OverrunMovementAudit
 
         Vector2 open = Vector2.zero;
         bool found = false;
+        if (procedural)
+        {
+            var room = proceduralRooms[0];
+            open = (Vector2)room.transform.position + new Vector2(room.width / 2, room.height / 2);
+            found = true; // The reserved cross provides four clear movement paths.
+        }
         for (int y = 4; y < level.Map.Height - 4 && !found; y++)
             for (int x = 4; x < level.Map.Width - 4 && !found; x++)
             {
@@ -136,15 +155,36 @@ public static class OverrunMovementAudit
             Step(player, 5);
             Require(Vector2.Distance(body.position, stop) < .01f, "Player keeps moving when input is released.");
 
-            Place(body, new Vector2(2.5f, 24.5f));
+            var wallTest = procedural ? (Vector2)proceduralRooms[0].transform.position + new Vector2(2.5f, 3.5f) : new Vector2(2.5f, 24.5f);
+            Place(body, wallTest);
             Press(keyboard, Key.A);
             Step(player, 40);
-            Require(body.position.x > 1.3f && body.position.x < 1.7f, "Player did not stop at the left wall: " + body.position);
+            float wallStop = procedural ? proceduralRooms[0].transform.position.x + 1.45f : 1.5f;
+            Require(Mathf.Abs(body.position.x - wallStop) < .16f, "Player did not stop at the left wall: " + body.position);
             report.AppendLine("Solid wall stops movement.");
 
             // Find a furniture cell with a clear three-cell approach from the left.
             var maps = level.GetComponentsInChildren<Tilemap>();
             bool checkedFurniture = false;
+            if (procedural)
+            {
+                foreach (var collider in level.GetComponentsInChildren<Collider2D>())
+                {
+                    if (!collider.GetComponent<SpriteRenderer>()) continue;
+                    var bounds = collider.bounds;
+                    var approach = new Vector2(bounds.min.x - 2.5f, bounds.center.y);
+                    if (Physics2D.OverlapBox(new Vector2(bounds.min.x - 1.6f, bounds.center.y), new Vector2(3f, 1f), 0, walls)) continue;
+                    Place(body, approach);
+                    Press(keyboard, Key.D);
+                    Step(player, 35);
+                    Require(body.position.x < bounds.min.x - .35f && body.position.x > bounds.min.x - .65f,
+                        "Player did not stop at prop footprint: " + collider.name + " " + body.position);
+                    Require(!Physics2D.OverlapCircle(body.position, .35f, walls), "Player ended inside a prop.");
+                    checkedFurniture = true;
+                    report.AppendLine("Prop base collider stops movement without trapping the player.");
+                    break;
+                }
+            }
             foreach (var map in maps)
             {
                 if (map.name != "ShortObjects") continue;
@@ -168,11 +208,11 @@ public static class OverrunMovementAudit
                 if (checkedFurniture) break;
             }
             Require(checkedFurniture, "No furniture approach was tested.");
-            player.Damage(float.MaxValue);
-            Require(Vector2.Distance(body.position, level.PlayerStart) < .01f, "Death respawn is outside the safe spawn.");
+            player.ResetRun();
+            Require(Vector2.Distance(body.position, level.PlayerStart) < .01f, "Run reset is outside the safe spawn.");
             follow.SendMessage("LateUpdate");
             Require(Vector2.Distance(camera.transform.position, player.transform.position) < .01f, "Camera does not track player position.");
-            report.AppendLine("Respawn stays on clear floor; close camera follows player.");
+            report.AppendLine("Run reset restores the player on clear floor; close camera follows player.");
         }
         finally
         {

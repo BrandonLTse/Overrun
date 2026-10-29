@@ -16,6 +16,7 @@ public class LevelGenerator : MonoBehaviour
     public GridMap Map { get; private set; }
     public Vector2 PlayerStart { get; private set; }
     public readonly List<SpawnPoint> SpawnPoints = new List<SpawnPoint>();
+    public bool ConnectivityValid { get; private set; }
 
     bool[,] openEast, openNorth;
     readonly List<RoomTemplate> rooms = new List<RoomTemplate>();
@@ -24,6 +25,7 @@ public class LevelGenerator : MonoBehaviour
     public void Generate()
     {
         if (templates == null || templates.Length == 0) { Debug.LogError("LevelGenerator needs at least one room template."); return; }
+        ConnectivityValid = false;
         rng = new System.Random(seed != 0 ? seed : System.Environment.TickCount);
         openEast = new bool[gridW, gridH]; openNorth = new bool[gridW, gridH];
         CarveSpanningTree(); EnsureMinimumConnections(); AddLoops(); BuildRooms();
@@ -32,22 +34,37 @@ public class LevelGenerator : MonoBehaviour
         for (int attempt = 0; attempt < maxObstacleAttempts && !valid; attempt++)
         {
             foreach (var room in rooms) room.RandomizeObstacles(rng);
-            // Tilemap colliders normally update in LateUpdate, after this Start-time
-            // spawn/pathfinding scan. Finish their geometry before querying physics.
-            foreach (var room in rooms)
-            {
-                foreach (var collider in room.GetComponentsInChildren<TilemapCollider2D>())
-                    collider.ProcessTilemapChanges();
-                foreach (var composite in room.GetComponentsInChildren<CompositeCollider2D>())
-                    composite.GenerateGeometry();
-            }
-            Physics2D.SyncTransforms();
-            Map = new GridMap(Vector2.zero, gridW * roomW, gridH * roomH, cellSize, wallMask);
-            CollectSpawnPoints();
+            ScanGeometry();
             valid = Map.NearestWalkable(desiredStart, 12, out start) && Validate(start);
         }
-        if (!valid) Debug.LogWarning("LevelGenerator: obstacle layout did not pass connectivity validation.");
+        if (!valid)
+        {
+            // Fail safely if a future prop/footprint change makes sampling too dense.
+            // Never knowingly begin a procedural run with sealed rooms or spawns.
+            foreach (var room in rooms)
+            {
+                var procedural = room.GetComponent<OverrunProceduralRoom>();
+                if (procedural) procedural.ClearObstacles();
+            }
+            ScanGeometry();
+            valid = Map.NearestWalkable(desiredStart, 12, out start) && Validate(start);
+            if (!valid) throw new System.InvalidOperationException("LevelGenerator: room layout failed connectivity validation.");
+            Debug.LogWarning("LevelGenerator: cleared procedural obstacles to preserve safe routes.");
+        }
+        ConnectivityValid = true;
         PlayerStart = Map.CellCenter(start);
+    }
+
+    void ScanGeometry()
+    {
+        foreach (var room in rooms)
+        {
+            foreach (var collider in room.GetComponentsInChildren<TilemapCollider2D>()) collider.ProcessTilemapChanges();
+            foreach (var composite in room.GetComponentsInChildren<CompositeCollider2D>()) composite.GenerateGeometry();
+        }
+        Physics2D.SyncTransforms();
+        Map = new GridMap(Vector2.zero, gridW * roomW, gridH * roomH, cellSize, wallMask);
+        CollectSpawnPoints();
     }
 
     void CollectSpawnPoints() { SpawnPoints.Clear(); foreach (var room in rooms) SpawnPoints.AddRange(room.GetComponentsInChildren<SpawnPoint>()); }
@@ -106,6 +123,16 @@ public class LevelGenerator : MonoBehaviour
     bool IsOpen(Vector2Int a, Vector2Int b) { if (!InGrid(b)) return false; if (b.x > a.x) return openEast[a.x, a.y]; if (b.x < a.x) return openEast[b.x, b.y]; if (b.y > a.y) return openNorth[a.x, a.y]; return openNorth[b.x, b.y]; }
     void BuildRooms()
     {
+        // Unity's script refresh can discard the managed cache while retaining
+        // runtime scene children. They are still owned rooms, not new templates.
+        foreach (Transform child in transform)
+            if (child.TryGetComponent<RoomTemplate>(out var existing) && !rooms.Contains(existing)) rooms.Add(existing);
+        foreach (var old in rooms)
+        {
+            if (!old) continue;
+            old.gameObject.SetActive(false);
+            if (Application.isPlaying) Destroy(old.gameObject); else DestroyImmediate(old.gameObject);
+        }
         rooms.Clear();
         for (int y = 0; y < gridH; y++) for (int x = 0; x < gridW; x++)
         {
